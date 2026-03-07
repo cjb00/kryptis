@@ -1,0 +1,7 @@
+/target
+*.d
+Cargo.lock
+.DS_Store
+*.log
+/tmp
+~/.kryptis
