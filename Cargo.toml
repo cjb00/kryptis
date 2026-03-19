@@ -37,6 +37,10 @@ rocksdb = "0.21"
 # CLI
 clap = { version = "4.0", features = ["derive"] }
 
+# HTTP RPC
+axum = "0.7"
+tower = "0.5"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

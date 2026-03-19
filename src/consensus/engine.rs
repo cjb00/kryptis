@@ -17,7 +17,7 @@ use std::{
 
 use tokio::{
     sync::{mpsc, RwLock},
-    time::{timeout, Duration},
+    time::Duration,
 };
 use tracing::{debug, error, info, warn};
 
@@ -154,7 +154,9 @@ impl ConsensusEngine {
     /// Main consensus loop.
     ///
     /// Processes incoming network messages and drives the consensus state
-    /// machine forward.  Timeouts advance the round when progress stalls.
+    /// machine forward.  A per-step deadline advances the round when
+    /// progress stalls.  A separate 5-second interval re-broadcasts this
+    /// node's `ValidatorAnnounce` so late-joining peers learn about it.
     pub async fn run(&mut self, mut msg_rx: mpsc::Receiver<NetworkMessage>) {
         // Sync height from chain state
         {
@@ -162,6 +164,32 @@ impl ConsensusEngine {
             self.current_height = chain.height() + 1;
         }
         info!(height = self.current_height, "Consensus engine started");
+
+        // Startup grace period: drain any queued ValidatorAnnounce messages
+        // so that multi-node deployments share a complete validator set before
+        // the first block is proposed.  Solo nodes proceed immediately after
+        // the timeout.
+        let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = startup_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                msg = msg_rx.recv() => {
+                    match msg {
+                        Some(m) => { self.handle_message(m).await.ok(); }
+                        None => return, // channel closed
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => break,
+            }
+        }
+
+        // Periodic validator re-announcement (every 5 s).
+        let mut announce_interval =
+            tokio::time::interval(Duration::from_secs(5));
+        announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             // Check if we are the proposer for the current height
@@ -180,31 +208,28 @@ impl ConsensusEngine {
                 }
             }
 
-            // Wait for a message with a timeout
-            let recv_result = timeout(
-                match self.step {
-                    ConsensusStep::Propose => PROPOSE_TIMEOUT,
-                    ConsensusStep::Prevote => PREVOTE_TIMEOUT,
-                    ConsensusStep::Precommit => PRECOMMIT_TIMEOUT,
-                    ConsensusStep::Commit => Duration::from_millis(100),
-                },
-                msg_rx.recv(),
-            )
-            .await;
+            let step_timeout = match self.step {
+                ConsensusStep::Propose => PROPOSE_TIMEOUT,
+                ConsensusStep::Prevote => PREVOTE_TIMEOUT,
+                ConsensusStep::Precommit => PRECOMMIT_TIMEOUT,
+                ConsensusStep::Commit => Duration::from_millis(100),
+            };
 
-            match recv_result {
-                Ok(Some(msg)) => {
-                    if let Err(e) = self.handle_message(msg).await {
-                        debug!(error = %e, "Message handling error");
+            tokio::select! {
+                msg = msg_rx.recv() => {
+                    match msg {
+                        Some(m) => {
+                            if let Err(e) = self.handle_message(m).await {
+                                debug!(error = %e, "Message handling error");
+                            }
+                        }
+                        None => {
+                            info!("Message channel closed; consensus engine stopping");
+                            break;
+                        }
                     }
                 }
-                Ok(None) => {
-                    // Channel closed
-                    info!("Message channel closed; consensus engine stopping");
-                    break;
-                }
-                Err(_timeout) => {
-                    // Timeout: advance the round
+                _ = tokio::time::sleep(step_timeout) => {
                     warn!(
                         height = self.current_height,
                         round = self.current_round,
@@ -213,24 +238,61 @@ impl ConsensusEngine {
                     );
                     self.advance_round();
                 }
+                _ = announce_interval.tick() => {
+                    self.broadcast_validator_announce().await;
+                }
             }
+        }
+    }
+
+    /// Broadcast this node's validator identity to the network.
+    ///
+    /// Called every 5 s so that nodes which connect late still learn
+    /// about all validators without requiring explicit sync.
+    async fn broadcast_validator_announce(&self) {
+        let address = self.node_keypair.address();
+        let vs = self.validator_set.read().await;
+        if let Some(v) = vs.get_validator(&address) {
+            self.broadcast(NetworkMessage::ValidatorAnnounce(v.clone())).await;
         }
     }
 
     /// Route an incoming network message to the appropriate handler.
     async fn handle_message(&mut self, msg: NetworkMessage) -> KryptisResult<()> {
         match msg {
-            NetworkMessage::NewBlock(block) => {
-                self.handle_block(block).await
-            }
+            NetworkMessage::NewBlock(block) => self.handle_block(block).await,
             NetworkMessage::Prevote(vote) => self.handle_prevote(vote).await,
             NetworkMessage::Precommit(vote) => self.handle_precommit(vote).await,
             NetworkMessage::NewTransaction(tx) => {
                 let mut chain = self.chain.write().await;
                 chain.add_to_mempool(tx)
             }
+            NetworkMessage::ValidatorAnnounce(v) => {
+                self.handle_validator_announce(v).await
+            }
             _ => Ok(()), // Other message types handled by P2P layer
         }
+    }
+
+    /// Learn about a remote validator and add it to the local set.
+    ///
+    /// This is how nodes converge on a shared validator set without any
+    /// central coordinator.  Each validator periodically re-announces
+    /// itself; the first announcement triggers registration here.
+    async fn handle_validator_announce(
+        &mut self,
+        v: crate::consensus::validator::Validator,
+    ) -> KryptisResult<()> {
+        let mut vs = self.validator_set.write().await;
+        if vs.get_validator(&v.address).is_none() {
+            let addr = v.address.clone();
+            vs.register(v)
+                .map_err(|e| KryptisError::ConsensusError(e.to_string()))?;
+            vs.transition_epoch();
+            self.storage.save_validator_set(&vs)?;
+            info!(address = %addr, "Learned new validator via gossip");
+        }
+        Ok(())
     }
 
     /// Check whether this node is the block proposer for the current height.

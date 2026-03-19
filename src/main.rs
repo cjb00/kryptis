@@ -29,7 +29,8 @@ use kryptis_lib::{
         chain::Chain,
         crypto::Keypair,
     },
-    network::node::{NodeConfig, P2PNode},
+    network::{messages::NetworkMessage, node::{NodeConfig, P2PNode}},
+    rpc::RpcState,
     storage::{rocksdb::RocksStorage, Storage},
     wallet::Wallet,
 };
@@ -215,8 +216,7 @@ async fn start_node(
     let sequencer = Arc::new(RotatingSequencer::new(validator_set.clone()));
 
     // 6. Message channels
-    let (consensus_tx, consensus_rx) = mpsc::channel::<kryptis_lib::network::messages::NetworkMessage>(1024);
-    let (broadcast_tx_holder, _) = mpsc::channel::<kryptis_lib::network::messages::NetworkMessage>(1024);
+    let (consensus_tx, consensus_rx) = mpsc::channel::<NetworkMessage>(1024);
 
     // 7. Consensus engine
     let mut engine = ConsensusEngine::new(
@@ -226,7 +226,6 @@ async fn start_node(
         node_keypair.clone(),
         sequencer,
     );
-    engine.set_msg_out(broadcast_tx_holder.clone());
 
     // 8. P2P node
     let p2p_config = NodeConfig {
@@ -238,11 +237,45 @@ async fn start_node(
 
     let p2p_node = P2PNode::new(&wallet.keypair, p2p_config).await?;
     let outbound_tx = p2p_node.outbound_sender();
+    let peer_count = p2p_node.peer_count_handle();
 
     // Wire consensus engine to broadcast via P2P
-    engine.set_msg_out(outbound_tx);
+    engine.set_msg_out(outbound_tx.clone());
 
-    // 9. Spawn tasks
+    // 9. Initial ValidatorAnnounce — broadcast 2 s after startup so peers
+    //    have time to connect before the first announcement.
+    if is_validator {
+        let local_validator = {
+            let vs = validator_set.read().await;
+            vs.get_validator(&wallet.address()).cloned()
+        };
+        if let Some(v) = local_validator {
+            let announce_tx = outbound_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                announce_tx.send(NetworkMessage::ValidatorAnnounce(v)).await.ok();
+            });
+        }
+    }
+
+    // 10. HTTP RPC server (port 8080)
+    let rpc_state = Arc::new(RpcState {
+        chain: chain.clone(),
+        validator_set: validator_set.clone(),
+        storage: storage.clone() as Arc<dyn kryptis_lib::storage::Storage>,
+        peer_count,
+    });
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
+            .await
+            .expect("RPC listener bind failed");
+        info!("HTTP RPC server listening on http://0.0.0.0:8080");
+        axum::serve(listener, kryptis_lib::rpc::router(rpc_state))
+            .await
+            .expect("RPC server error");
+    });
+
+    // 11. Spawn P2P and consensus tasks
     let consensus_tx_clone = consensus_tx.clone();
     let p2p_handle = tokio::spawn(async move {
         p2p_node.start(consensus_tx_clone).await;
@@ -254,7 +287,8 @@ async fn start_node(
 
     info!("All subsystems started. Node is running.");
     println!("Kryptis node is running");
-    println!("Node address: {}", wallet.address());
+    println!("Node address:  {}", wallet.address());
+    println!("RPC endpoint:  http://localhost:8080");
     println!("Press Ctrl+C to stop.");
 
     // Wait for shutdown

@@ -5,17 +5,17 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    consensus::engine::Vote,
+    consensus::{engine::Vote, validator::Validator},
     core::{block::Block, transaction::Transaction},
 };
 
 /// The union of all message types that can traverse the Kryptis P2P network.
 ///
 /// Each variant maps to a GossipSub topic:
-/// - `NewBlock`, `ResponseBlock` → `kryptis/blocks`
-/// - `NewTransaction`            → `kryptis/transactions`
-/// - `Prevote`, `Precommit`      → `kryptis/votes`
-/// - `PeerHello`, `RequestBlock` → any topic (typically `kryptis/blocks`)
+/// - `NewBlock`, `ResponseBlock`, `RequestBlock` → `kryptis/blocks`
+/// - `NewTransaction`                             → `kryptis/transactions`
+/// - `Prevote`, `Precommit`                       → `kryptis/votes`
+/// - `ValidatorAnnounce`, `PeerHello`             → `kryptis/validators`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
     /// A newly proposed or committed block.
@@ -46,6 +46,12 @@ pub enum NetworkMessage {
 
     /// Response to a `RequestBlock` (may be `None` if not found).
     ResponseBlock(Option<Block>),
+
+    /// A validator broadcasting its identity and stake to peers.
+    ///
+    /// Sent periodically and on every new connection so that all nodes
+    /// converge on the same validator set without any central coordinator.
+    ValidatorAnnounce(Validator),
 }
 
 #[cfg(test)]

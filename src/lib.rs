@@ -10,12 +10,14 @@
 //! - [`availability`] — data availability layer stubs (Phase 4)
 //! - [`wallet`] — keypair management and transaction signing
 //! - [`cli`] — command-line interface
+//! - [`rpc`] — HTTP JSON-RPC server (axum 0.7)
 
 pub mod availability;
 pub mod cli;
 pub mod consensus;
 pub mod core;
 pub mod network;
+pub mod rpc;
 pub mod settlement;
 pub mod storage;
 pub mod wallet;

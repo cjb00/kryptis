@@ -7,7 +7,13 @@
 /// `SwarmBuilder::with_behaviour` call (which requires an infallible
 /// closure in libp2p 0.52+) so that errors can be propagated via
 /// `KryptisResult` before the swarm is constructed.
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use futures::StreamExt;
 use libp2p::{
@@ -81,6 +87,10 @@ pub struct P2PNode {
     txs_topic: gossipsub::IdentTopic,
     /// GossipSub topic for consensus vote messages.
     votes_topic: gossipsub::IdentTopic,
+    /// GossipSub topic for validator announcements.
+    validators_topic: gossipsub::IdentTopic,
+    /// Live count of connected peers, shared with the RPC layer.
+    peer_count: Arc<AtomicUsize>,
 }
 
 impl P2PNode {
@@ -97,6 +107,7 @@ impl P2PNode {
         let blocks_topic = gossipsub::IdentTopic::new("kryptis/blocks");
         let txs_topic = gossipsub::IdentTopic::new("kryptis/transactions");
         let votes_topic = gossipsub::IdentTopic::new("kryptis/votes");
+        let validators_topic = gossipsub::IdentTopic::new("kryptis/validators");
 
         // Pre-build gossipsub (infallible closure required by libp2p 0.52+).
         let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -120,6 +131,9 @@ impl P2PNode {
             .map_err(|e| KryptisError::NetworkError(e.to_string()))?;
         gossipsub_behaviour
             .subscribe(&votes_topic)
+            .map_err(|e| KryptisError::NetworkError(e.to_string()))?;
+        gossipsub_behaviour
+            .subscribe(&validators_topic)
             .map_err(|e| KryptisError::NetworkError(e.to_string()))?;
 
         // Pre-build mDNS.
@@ -178,6 +192,8 @@ impl P2PNode {
             blocks_topic,
             txs_topic,
             votes_topic,
+            validators_topic,
+            peer_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -186,6 +202,11 @@ impl P2PNode {
     /// Must be called before [`start`] since `start` consumes `self`.
     pub fn outbound_sender(&self) -> mpsc::Sender<NetworkMessage> {
         self.outbound_tx.clone()
+    }
+
+    /// Return a shared handle to the live peer count (updated by the event loop).
+    pub fn peer_count_handle(&self) -> Arc<AtomicUsize> {
+        self.peer_count.clone()
     }
 
     /// Connect to a peer by multiaddr.
@@ -211,6 +232,8 @@ impl P2PNode {
         let blocks_topic = self.blocks_topic.clone();
         let txs_topic = self.txs_topic.clone();
         let votes_topic = self.votes_topic.clone();
+        let validators_topic = self.validators_topic.clone();
+        let peer_count = self.peer_count.clone();
 
         loop {
             tokio::select! {
@@ -265,9 +288,19 @@ impl P2PNode {
                             peer_id, ..
                         } => {
                             info!(peer = %peer_id, "Peer connected");
+                            // Add to GossipSub mesh so messages flow to this peer.
+                            // (mDNS peers go through add_explicit_peer in the mDNS
+                            // Discovered handler; bootstrap peers dialled via --peers
+                            // only trigger ConnectionEstablished, not mDNS.)
+                            self.swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .add_explicit_peer(&peer_id);
+                            peer_count.fetch_add(1, Ordering::Relaxed);
                         }
                         libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             debug!(peer = %peer_id, "Peer disconnected");
+                            peer_count.fetch_sub(1, Ordering::Relaxed);
                         }
                         _ => {}
                     }
@@ -280,8 +313,9 @@ impl P2PNode {
                         | NetworkMessage::RequestBlock { .. } => blocks_topic.clone(),
                         NetworkMessage::NewTransaction(_) => txs_topic.clone(),
                         NetworkMessage::Prevote(_)
-                        | NetworkMessage::Precommit(_)
-                        | NetworkMessage::PeerHello { .. } => votes_topic.clone(),
+                        | NetworkMessage::Precommit(_) => votes_topic.clone(),
+                        NetworkMessage::ValidatorAnnounce(_)
+                        | NetworkMessage::PeerHello { .. } => validators_topic.clone(),
                     };
 
                     match serde_json::to_vec(&msg) {

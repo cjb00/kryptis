@@ -226,6 +226,11 @@ impl Chain {
         self.accounts.get(address).map_or(0, |a| a.staked)
     }
 
+    /// Return the transaction nonce of `address`.
+    pub fn nonce_of(&self, address: &str) -> u64 {
+        self.accounts.get(address).map_or(0, |a| a.nonce)
+    }
+
     /// Credit `amount` base units to `address` without a corresponding debit.
     ///
     /// Used during genesis setup to bootstrap initial balances.
