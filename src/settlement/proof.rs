@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{
     crypto::{Address, Hash},
-    error::KryptisResult,
+    error::{KryptisError, KryptisResult},
 };
 
 /// A ZK validity proof submitted from the execution domain (Layer 2)
@@ -92,6 +92,49 @@ impl ProofVerifier for StubVerifier {
     fn verify(&self, _proof: &SettlementProof, _domain: &DomainState) -> KryptisResult<()> {
         // TODO Phase 3: Replace with real ZK proof verification.
         // Use PLONK/Halo2 or Risc0/SP1 proving system.
+        Ok(())
+    }
+}
+
+/// A Risc0-backed ZK proof verifier.
+///
+/// Deserializes the `proof_bytes` field of `SettlementProof` as a
+/// `risc0_zkvm::Receipt`, verifies the receipt against the compiled
+/// guest image ID, then checks that the committed state transition
+/// matches the on-chain `DomainState`.
+///
+/// In `RISC0_DEV_MODE=1` the mock prover produces receipts that pass
+/// `receipt.verify()` without real ZK computation, so this verifier
+/// works identically in dev and production — only the proving cost differs.
+pub struct Risc0Verifier;
+
+impl ProofVerifier for Risc0Verifier {
+    fn verify(&self, proof: &SettlementProof, domain: &DomainState) -> KryptisResult<()> {
+        use crate::settlement::prover::KRYPTIS_GUEST_ID;
+
+        let receipt: risc0_zkvm::Receipt =
+            bincode::deserialize(&proof.proof_bytes).map_err(|e| {
+                KryptisError::ProofVerificationFailed(format!("receipt decode: {e}"))
+            })?;
+
+        receipt.verify(KRYPTIS_GUEST_ID).map_err(|e| {
+            KryptisError::ProofVerificationFailed(format!("receipt verify: {e}"))
+        })?;
+
+        let output: kryptis_types::BatchOutput = receipt.journal.decode().map_err(|e| {
+            KryptisError::ProofVerificationFailed(format!("journal decode: {e}"))
+        })?;
+
+        // old state root must match what's registered on-chain
+        if hex::encode(output.old_state_root) != domain.state_root {
+            return Err(KryptisError::StateMismatch);
+        }
+
+        // new state root must match what the proof claims
+        if hex::encode(output.new_state_root) != proof.new_state_root {
+            return Err(KryptisError::StateMismatch);
+        }
+
         Ok(())
     }
 }

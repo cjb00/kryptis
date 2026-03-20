@@ -1,0 +1,17 @@
+[package]
+name = "kryptis-guest"
+version = "0.1.0"
+edition = "2021"
+description = "Kryptis zkVM guest program — proves UTXO payment batch validity"
+
+[[bin]]
+name = "kryptis-guest"
+path = "src/main.rs"
+
+[dependencies]
+# zkVM guest runtime (std feature enables standard library in the zkVM)
+risc0-zkvm = { version = "3.0", features = ["std"], default-features = false }
+# Shared types with the host
+kryptis-types = { path = "../kryptis-types" }
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"

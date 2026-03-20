@@ -16,6 +16,7 @@ pub mod availability;
 pub mod cli;
 pub mod consensus;
 pub mod core;
+pub mod execution;
 pub mod network;
 pub mod rpc;
 pub mod settlement;

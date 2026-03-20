@@ -70,6 +70,22 @@ pub enum KryptisError {
     /// The sequencer could not fulfil a request.
     #[error("Sequencer error: {0}")]
     SequencerError(String),
+
+    /// A ZK proof could not be generated.
+    #[error("Proof generation failed: {0}")]
+    ProofGenerationFailed(String),
+
+    /// A ZK proof failed verification.
+    #[error("Proof verification failed: {0}")]
+    ProofVerificationFailed(String),
+
+    /// The state root in a proof does not match the expected domain state.
+    #[error("State root mismatch between proof and domain state")]
+    StateMismatch,
+
+    /// An execution domain error (UTXO, payment, batch).
+    #[error("Execution error: {0}")]
+    ExecutionError(String),
 }
 
 /// Convenience alias used throughout the codebase.

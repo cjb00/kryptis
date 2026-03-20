@@ -31,6 +31,7 @@ use kryptis_lib::{
     },
     network::{messages::NetworkMessage, node::{NodeConfig, P2PNode}},
     rpc::RpcState,
+    settlement::proof::Risc0Verifier,
     storage::{rocksdb::RocksStorage, Storage},
     wallet::Wallet,
 };
@@ -264,6 +265,7 @@ async fn start_node(
         validator_set: validator_set.clone(),
         storage: storage.clone() as Arc<dyn kryptis_lib::storage::Storage>,
         peer_count,
+        verifier: Arc::new(Risc0Verifier),
     });
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
