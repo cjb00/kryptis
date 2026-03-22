@@ -4,6 +4,8 @@ A modular, from-scratch **Proof of Stake blockchain** written in Rust.
 
 Kryptis implements a structurally correct **Tendermint BFT** consensus protocol with a rotating stake-weighted sequencer, ed25519 cryptography, RocksDB persistence, and a libp2p peer-to-peer network — all in a single self-contained binary (~11 MB release build).
 
+**Phase 3** adds a UTXO execution domain and **zero-knowledge settlement** via [Risc0](https://risczero.com): the base chain never sees individual payments, only `old_state_root → new_state_root + ZK proof`.
+
 ---
 
 ## Features
@@ -19,13 +21,15 @@ Kryptis implements a structurally correct **Tendermint BFT** consensus protocol 
 | **Networking** | libp2p · GossipSub message propagation · mDNS peer discovery · Noise encryption · Yamux multiplexing |
 | **Epochs** | 100-block epochs; 2 KRS block reward per committed block |
 | **Slashing** | Double-sign 5% · Downtime 1% (basis points) |
+| **UTXO execution domain** | Layer-2 payment domain with atomic batch execution and fee-priority ordering |
+| **ZK settlement** | Risc0 zkVM proves UTXO state transitions off-chain; base chain verifies proof only |
 
 ---
 
 ## Architecture
 
 ```
-kryptis/
+kryptis/                         # Root workspace member (host binary)
 ├── src/
 │   ├── main.rs                  # Entry point, CLI dispatch, node bootstrap
 │   ├── lib.rs                   # Library crate root
@@ -42,6 +46,11 @@ kryptis/
 │   │   ├── sequencer.rs         # RotatingSequencer — selects proposer per height
 │   │   └── validator.rs         # ValidatorSet, staking, slashing, proposer selection
 │   │
+│   ├── execution/               # Phase 3 — UTXO execution domain
+│   │   ├── utxo.rs              # Utxo, UtxoSet, Payment, PaymentOutput
+│   │   ├── batch.rs             # PaymentBatch — atomic execution with rollback
+│   │   └── domain.rs            # ExecutionDomain — mempool, fee ordering, produce_batch
+│   │
 │   ├── network/
 │   │   ├── node.rs              # libp2p SwarmBuilder, GossipSub, mDNS
 │   │   └── messages.rs          # NetworkMessage (block · vote · tx · peer)
@@ -53,11 +62,23 @@ kryptis/
 │   ├── wallet/
 │   │   └── mod.rs               # Wallet — load/save, create_transfer/stake/unstake
 │   │
-│   ├── settlement/              # Phase 3 stub — ZK settlement proof verifier
+│   ├── settlement/              # Phase 3 — ZK settlement
+│   │   ├── proof.rs             # ProofVerifier trait, StubVerifier, Risc0Verifier
+│   │   └── prover.rs            # Prover — prove_batch(), verify() via Risc0
+│   │
 │   ├── availability/            # Phase 4 stub — data availability layer
 │   │
 │   └── cli/
 │       └── mod.rs               # clap 4 CLI definitions and command handlers
+│
+├── kryptis-types/               # Shared types between host and zkVM guest
+│   └── src/lib.rs               # SerializableUtxo, BatchInput/Output, compute_state_root()
+│
+├── kryptis-guest/               # Risc0 zkVM guest program (compiled to RISC-V)
+│   └── src/main.rs              # Proves: old_root + payments → new_root
+│
+├── tests/
+│   └── e2e_settlement.rs        # End-to-end ZK settlement tests
 │
 └── scripts/
     └── testnet.sh               # 4-node local testnet launcher
@@ -87,6 +108,39 @@ Each block height runs one or more **rounds**. A round has four steps:
 | `block:{height}` | JSON-serialised `Block` (header + transactions) |
 | `chain:tip` | Current tip height as `u64` |
 | `validator_set` | JSON-serialised `ValidatorSet` |
+
+### ZK Settlement Architecture
+
+The base chain validates **state transitions**, not individual payments. All payment execution happens off-chain in an `ExecutionDomain`:
+
+```
+User submits Payment
+        │
+        ▼
+ExecutionDomain (Layer 2)
+  ├── UtxoSet  — tracks unspent outputs, nullifiers
+  ├── Mempool  — fee-priority ordering
+  └── produce_batch() → PaymentBatch
+                              │
+                              ▼
+                    Prover::prove_batch()
+                    (Risc0 zkVM guest)
+                      ├── Verifies old_state_root
+                      ├── Executes payments inside VM
+                      └── Commits new_state_root → Receipt
+                              │
+                              ▼
+                    POST /settlement  (base chain RPC)
+                    Risc0Verifier::verify(receipt)
+                      ├── receipt.verify(KRYPTIS_GUEST_ID)
+                      └── journal.decode() → BatchOutput
+                              │
+                              ▼
+                    Chain::update_domain_state()
+                    (records new_state_root on L1)
+```
+
+The zkVM guest (`kryptis-guest`) is compiled to RISC-V and embedded into the host binary at build time. The base chain only ever stores the 32-byte state roots and the proof — individual UTXOs and payment details remain off-chain.
 
 ---
 
@@ -286,17 +340,17 @@ kryptis chain block --height 42
 ## Development
 
 ```sh
-# Run all 78 tests
-cargo test --all
+# Run all 101 tests (98 unit + 3 e2e ZK settlement)
+RISC0_DEV_MODE=1 cargo test --all
 
 # Run tests with log output visible
-RUST_LOG=debug cargo test --all -- --nocapture
+RUST_LOG=debug RISC0_DEV_MODE=1 cargo test --all -- --nocapture
 
 # Lint (zero warnings enforced)
-cargo clippy --all-targets -- -D warnings
+RISC0_DEV_MODE=1 RISC0_SKIP_BUILD=1 cargo clippy --all -- -D warnings
 
 # Check without building
-cargo check
+RISC0_DEV_MODE=1 cargo check
 ```
 
 ### Environment Variables
@@ -305,6 +359,21 @@ cargo check
 |---|---|---|
 | `RUST_LOG` | `kryptis=info` | Log verbosity — `trace` · `debug` · `info` · `warn` · `error` |
 | `KRYPTIS_BIN` | `./target/release/kryptis` | Override binary path in `testnet.sh` |
+| `RISC0_DEV_MODE` | _(unset)_ | Set to `1` to use mock proving — skips real ZK proof generation. **Required for all development and testing. Never use in production.** |
+| `RISC0_SKIP_BUILD` | _(unset)_ | Set to `1` to skip RISC-V guest compilation in `build.rs`. Set automatically when `RISC0_DEV_MODE=1` is present. |
+
+### Real ZK Proving (production)
+
+To generate cryptographically valid proofs (not mock), install the Risc0 toolchain:
+
+```sh
+curl -L https://risczero.com/install | bash
+rzup install
+# Then build/run WITHOUT RISC0_DEV_MODE
+cargo build --release
+```
+
+Real proving requires the RISC-V target and is significantly slower than dev mode (seconds to minutes per batch depending on circuit size).
 
 ---
 
@@ -313,8 +382,8 @@ cargo check
 | Phase | Status | Scope |
 |---|---|---|
 | **Phase 1** | ✅ Complete | Core chain, Tendermint BFT, RocksDB, P2P networking, CLI |
-| **Phase 2** | 🔧 Next | HTTP/JSON-RPC server, mempool, transaction broadcasting, balance queries |
-| **Phase 3** | 📋 Planned | Unbonding period (21-day), delegation, governance, ZK settlement proofs |
+| **Phase 2** | ✅ Complete | HTTP/JSON-RPC server, mempool, transaction broadcasting, balance queries, multi-node consensus |
+| **Phase 3** | ✅ Complete | UTXO execution domain, Risc0 ZK settlement, `POST /settlement` RPC, e2e tests |
 | **Phase 4** | 📋 Planned | Distributed data availability layer, light clients, IBC bridge |
 
 ---
